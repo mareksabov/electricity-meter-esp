@@ -2,6 +2,9 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include "esp_wifi.h"
+#include <ArduinoJson.h>
+#include <Preferences.h>
+
 
 // ====== Wi-Fi ======
 const char* WIFI_SSID = "C3PO-IoT";
@@ -31,6 +34,40 @@ WebServer server(8080);
 
 // Voliteľné: biela LED (flash) na GPIO 4
 #define LED_PIN            4
+
+struct RoiConfig {
+  int x;
+  int y;
+  int w;
+  int h;
+};
+
+Preferences prefs;
+RoiConfig roi = {0, 0, 20, 20};  // default
+const char* NVS_NS = "roi_cfg";
+
+bool saveRoiToNvs(const RoiConfig& r) {
+  if (!prefs.begin(NVS_NS, /*readOnly=*/false)) return false;
+  prefs.putInt("x", r.x);
+  prefs.putInt("y", r.y);
+  prefs.putInt("w", r.w);
+  prefs.putInt("h", r.h);
+  prefs.end();
+  return true;
+}
+
+bool loadRoiFromNvs(RoiConfig& r) {
+  if (!prefs.begin(NVS_NS, /*readOnly=*/true)) return false;
+  bool has = prefs.isKey("x") && prefs.isKey("y") && prefs.isKey("w") && prefs.isKey("h");
+  if (has) {
+    r.x = prefs.getInt("x", r.x);
+    r.y = prefs.getInt("y", r.y);
+    r.w = prefs.getInt("w", r.w);
+    r.h = prefs.getInt("h", r.h);
+  }
+  prefs.end();
+  return has;
+}
 
 // ---- Handler: aktuálny JPEG ----
 void handleShotJpg() {
@@ -63,6 +100,56 @@ void handleRoot() {
   server.send(200, "text/html", html);
 }
 
+void handleRoi() {
+  if (server.method() == HTTP_POST) {
+    String body = server.arg("plain");
+    if (body.length() == 0) {
+      server.send(400, "application/json", "{\"status\":\"error\",\"reason\":\"empty body\"}");
+      return;
+    }
+
+    StaticJsonDocument<200> doc;
+    auto err = deserializeJson(doc, body);
+    if (err) {
+      server.send(400, "application/json", "{\"status\":\"error\",\"reason\":\"invalid json\"}");
+      return;
+    }
+
+    int x = doc["x"] | -1;
+    int y = doc["y"] | -1;
+    int w = doc["w"] | -1;
+    int h = doc["h"] | -1;
+
+    // TODO: ak vieš šírku/výšku frame-u, validuj aj rozsah (x+w<=width, y+h<=height)
+    if (x < 0 || y < 0 || w <= 0 || h <= 0) {
+      server.send(400, "application/json", "{\"status\":\"error\",\"reason\":\"invalid values\"}");
+      return;
+    }
+
+    roi.x = x; roi.y = y; roi.w = w; roi.h = h;
+
+    // uložiť do NVS
+    bool ok = saveRoiToNvs(roi);
+    if (!ok) {
+      server.send(500, "application/json", "{\"status\":\"error\",\"reason\":\"nvs save failed\"}");
+      return;
+    }
+  }
+
+  // GET aj POST vrátia aktuálny stav
+  StaticJsonDocument<200> res;
+  res["roi_x"] = roi.x;
+  res["roi_y"] = roi.y;
+  res["roi_w"] = roi.w;
+  res["roi_h"] = roi.h;
+  res["status"] = "ok";
+
+  String response;
+  serializeJson(res, response);
+  server.send(200, "application/json", response);
+}
+
+
 void startCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -84,12 +171,13 @@ void startCamera() {
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
 
-  config.xclk_freq_hz = 20000000;
-  config.frame_size   = FRAMESIZE_SXGA;     // 1280x1024
+  // config.xclk_freq_hz = 20000000;
+  config.xclk_freq_hz = 10000000;         
+  config.frame_size   = FRAMESIZE_SVGA;     // 1280x1024
   config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode    = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location  = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 15;                 // menšie číslo = lepšia kvalita
+  config.jpeg_quality = 20;                 // menšie číslo = lepšia kvalita
   config.fb_count     = 2;
 
   esp_err_t err = esp_camera_init(&config);
@@ -199,9 +287,13 @@ void setup() {
   // --- Kamera ---
   startCamera();
 
+  // --- Roi ---
+  loadRoiFromNvs(roi); 
+
   // --- HTTP routy ---
   server.on("/", handleRoot);
   server.on("/shot.jpg", HTTP_GET, handleShotJpg);
+  // server.on("/roi", handleRoi);
 
   server.begin();
   Serial.println("HTTP server started on port 8080");
