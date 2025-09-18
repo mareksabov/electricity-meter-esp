@@ -1,0 +1,115 @@
+Návrh riešenia – ESP32-CAM LED pulzný detektor + OCR
+1. Východiskový stav
+
+Elektromer zobrazuje iba celé 1 kWh kroky → OCR zo snapshotov dáva schodovitý priebeh.
+
+Elektromer má červenú LED (napr. 1000 imp/kWh), ktorá bliká pri každom Wh.
+
+ESP32-CAM pôvodne poskytovalo len /shot.jpg endpoint s obrázkom pre OCR, Python server si ho ťahal a robil OCR.
+
+2. Cieľ
+
+Zachovať pôvodnú funkcionalitu /shot.jpg (rozlíšenie, kvalita, použiteľnosť pre OCR).
+
+Rozšíriť o pulzný detektor LED, ktorý:
+
+dáva jemnejšiu spotrebu po 1 Wh,
+
+umožní vypočítať okamžitý príkon z Δt medzi pulzmi,
+
+dá sa kalibrovať podľa OCR hodnoty.
+
+API rozšíriť o /roi (nastavenie vyrezanej oblasti) a /pulse (aktuálny stav počítadla).
+
+3. Nový koncept fungovania
+Kamera
+
+Kamera beží stále v režime full-frame 10 fps (napr. VGA/JPEG alebo iný formát podľa toho, čo vyžaduje OCR).
+
+Každý snímok sa:
+
+uloží ako „last_frame“ (v RAM, aby sa dal hneď vrátiť cez /shot.jpg),
+
+zároveň sa z neho spraví ROI výrez (podľa konfigurovaných súradníc),
+
+nad ROI sa spustí detekčná logika LED (prahy, hysteréza, refraktérne okno, stavový automat).
+
+/shot.jpg
+
+Nežije vlastným životom – pri HTTP dopyte /shot.jpg sa vráti posledný uložený frame z bežiaceho loopu.
+
+Tým pádom je:
+
+rozlíšenie/kvalita identické s tým, čo potrebuje OCR,
+
+žiadne re-inicializácie kamery, žiadne DMA chyby,
+
+detektor a OCR používajú tie isté dáta.
+
+Pulzný detektor
+
+Beží nad každým frame-om v ~10 fps loop-e.
+
+ROI → výpočet priemerného jasu → EMA filtrácia → hysteréza ON/OFF → pulzy na nábehu.
+
+Každý pulz inkrementuje counter, uloží Δt.
+
+V JSONe /pulse je:
+
+counter (monotónny počet od bootu),
+
+last_pulse_ms (čas medzi poslednými dvoma pulzmi),
+
+fps (reálne fps detektora),
+
+voliteľne diagnostika: aktuálna intenzita, baseline, stav.
+
+/roi
+
+GET → vráti aktuálne nastavené ROI (x, y, w, h).
+
+POST → nastaví nové ROI (uloží do NVS, prežije reštart).
+
+/pulse
+
+GET → JSON so stavom pulzového detektora.
+
+Používa sa na odčítanie spotreby a výkonu.
+
+4. Výpočet spotreby a výkonu
+
+Spotreba: Python si drží OCR kotvu (napr. 13489 kWh). Pulzy interpolujú medzi kotvami:
+
+total = OCR_total + (pulse_delta / k)
+
+
+Výkon:
+
+P [kW] = 3600 / (k * Δt [s])
+
+
+kde k = počet impulzov na kWh (typicky 1000).
+
+Python vie podľa času pulzu zaradiť spotrebu do T1/T2.
+
+5. Výhody nového prístupu
+
+Žiadne prepínanie režimov → stabilita (odstraňuje DMA overflow bugy).
+
+Jeden zdroj frame-ov pre obidve úlohy → konzistencia.
+
+OCR a pulzy majú spoločný časový základ → jednoduchšia fúzia.
+
+Rozšíriteľnosť → ROI nastaviteľné cez API, uložené v NVS.
+
+Jednoduché API:
+
+/shot.jpg – snapshot pre OCR,
+
+/roi – nastavenie ROI,
+
+/pulse – stav pulzového čítania.
+
+👉 Takto zostane presná funkcionalita /shot.jpg pre OCR a zároveň budeme mať z toho istého video-streamu aj pulzy pre jemné meranie a výkon.
+
+Chceš, aby som ti k tomuto návrhu ešte spravil aj schému dátových tokov (ako to tečie ESP → Python → MQTT), alebo stačí textová špecifikácia?

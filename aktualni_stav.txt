@@ -1,0 +1,37 @@
+Kamera & nastavenia
+
+ESP32-CAM beží v režime PIXFORMAT_JPEG + FRAMESIZE_SXGA (1280×1024).
+
+XCLK je spomalený na 10 MHz (stabilné snímanie).
+
+Driver má GRAB_LATEST a fb_count = 1 (berieme vždy najnovší frame, bez fronty).
+
+Získavanie snímok
+
+Na pozadí beží capture task ~10 FPS.
+
+Každý JPEG z kamery sa skopíruje do WR bufferu a v krátkej kritickej sekcii sa urobí ping-pong flip: WR ↔ RD.
+
+RD (read) drží posledný hotový JPEG, WR (write) je pripravený na ďalší frame.
+
+Buffery sú predalokované 2×512 kB v (P)SRAM a nikdy sa neuvoľňujú.
+
+Podávanie snímku pre klienta
+
+Endpoint /shot.jpg vracia posledný uložený JPEG z RD.
+
+Počas odosielania je RD označený rd_in_use, takže capture neflipne a neprepíše odosielaný obsah.
+
+Odošleme RAW HTTP odpoveď cez WiFiClient s presným Content-Length a MTU-friendly chunkmi.
+
+Zdravotný stav
+
+/health vracia stručné info: čas posledného framu, dĺžku posledného JPEG-u a cieľové FPS.
+
+ROI konfigurácia
+
+ROI štruktúra je pripravená a uchováva sa v NVS (funkcie saveRoiToNvs / loadRoiFromNvs).
+
+Handler /roi je implementovaný, ale aktuálne nezverejnený (zakomentovaný route).
+
+Teda: zariadenie nepretržite sníma SXGA JPEGy, bezpečne ich ukladá do ping-pong bufferov a /shot.jpg vždy podá posledný stabilný snímok bez rizika prepísania počas prenosu. Základ pre LED pulzný detektor (ROI v NVS, capture slučka) je týmto pripravený.
