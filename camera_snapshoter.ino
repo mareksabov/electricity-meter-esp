@@ -73,6 +73,44 @@ bool loadRoiFromNvs(RoiConfig &r)
 }
 
 // ====== Ping-pong JPEG buffery ======
+// === Analysis ping-pong buffers (Variant B preparation) ===
+// Independent copy for analysis task; keeps /shot.jpg path unchanged.
+static uint8_t *ana_front = nullptr; // published snapshot for analysis (read-only for analysis)
+static uint8_t *ana_back = nullptr;  // captureTask writes here then swaps to front
+static size_t ana_front_len = 0;     // current valid length in ana_front
+static size_t ana_back_cap = 0;      // allocated capacity of ana_back/front (equal sizes)
+
+// Lightweight sequencing for lock-free publish/consume of analysis JPEG
+static volatile uint32_t ana_seq = 0;      // increments on each publish
+static volatile uint32_t ana_seq_seen = 0; // last sequence processed by analysis
+
+// Optional: semaphore to wake the analysis task on new frame
+static SemaphoreHandle_t anaSem = nullptr;
+
+// ROI shared config (already persisted via /roi endpoints if enabled)
+typedef struct
+{
+  uint16_t x, y, w, h;
+} roi_t;
+static roi_t g_roi = {0, 0, 0, 0}; // loaded from NVS if available
+
+// Detector state placeholders (diagnostics + future /pulse)
+static volatile uint32_t g_pulse_counter = 0;
+static volatile uint32_t g_last_pulse_ms = 0;
+static volatile uint32_t g_last_interpulse_ms = 0;
+static volatile uint16_t g_last_R_mean = 0; // last computed mean of red channel in ROI (0..255)
+
+// EMA / hysteresis config (will be tuned later; placeholders)
+static float g_ema = 0.0f;
+static float EMA_ALPHA = 0.30f;
+static uint16_t TH_ON = 140;
+static uint16_t TH_OFF = 110;
+static uint32_t REFRACT_MS = 120;
+static volatile bool g_led_on = false;
+
+// Forward decl of the analysis task (implemented at end of file)
+void analysisTask(void *);
+
 static uint8_t *jpeg_rd = nullptr; // /shot.jpg číta z tohto
 static size_t jpeg_rd_len = 0;
 static size_t jpeg_rd_cap = 0;
@@ -181,6 +219,12 @@ void handleHealth()
   res["last_frame_ms"] = last_frame_ms;
   res["jpeg_len"] = jpeg_rd_len;
   res["fps"] = TARGET_FPS;
+
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Expires", "0");
+
   String s;
   serializeJson(res, s);
   server.send(200, "application/json", s);
@@ -282,6 +326,19 @@ void captureTask(void *param)
       if (fb->len <= jpeg_wr_cap)
       {
         memcpy(jpeg_wr, fb->buf, fb->len);
+        // === Variant B: publish a copy for analysis without blocking /shot.jpg ===
+        if (ana_back && ana_front && fb->len <= ana_back_cap)
+        {
+          memcpy(ana_back, fb->buf, fb->len);
+          // Pointer swap and sequence bump (single-writer, single-reader pattern)
+          uint8_t *tmp = ana_front;
+          ana_front = ana_back;
+          ana_back = tmp;
+          ana_front_len = fb->len;
+          ana_seq = ana_seq + 1;
+          if (anaSem)
+            xSemaphoreGive(anaSem);
+        }
 
         xSemaphoreTake(jpegMtx, portMAX_DELAY);
         if (!rd_in_use)
@@ -305,35 +362,67 @@ void captureTask(void *param)
 
 void startCaptureLoop()
 {
-  if (!jpegMtx)
-    jpegMtx = xSemaphoreCreateMutex();
-  if (!jpegMtx)
-  {
-    Serial.println("[ERR] Cannot create jpegMtx");
-    return;
-  }
+  Serial.println("[boot] startCaptureLoop() enter");
 
-  // Predalokuj dva perzistentné buffery
+  if (!jpegMtx) jpegMtx = xSemaphoreCreateMutex();
+  if (!jpegMtx) { Serial.println("[ERR] Cannot create jpegMtx"); return; }
+
+  // --- JPEG publish buffers ---
   jpeg_rd = (uint8_t *)heap_caps_malloc(JPEG_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   jpeg_wr = (uint8_t *)heap_caps_malloc(JPEG_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!jpeg_rd || !jpeg_wr)
-  {
-    Serial.println("[ERR] JPEG prealloc failed");
-    if (!jpeg_rd)
-      jpeg_rd = (uint8_t *)heap_caps_malloc(JPEG_BUF_SIZE, MALLOC_CAP_8BIT);
-    if (!jpeg_wr)
-      jpeg_wr = (uint8_t *)heap_caps_malloc(JPEG_BUF_SIZE, MALLOC_CAP_8BIT);
+  if (!jpeg_rd || !jpeg_wr) {
+    Serial.println("[WARN] JPEG PSRAM alloc failed, retry DRAM");
+    if (!jpeg_rd) jpeg_rd = (uint8_t *)heap_caps_malloc(JPEG_BUF_SIZE, MALLOC_CAP_8BIT);
+    if (!jpeg_wr) jpeg_wr = (uint8_t *)heap_caps_malloc(JPEG_BUF_SIZE, MALLOC_CAP_8BIT);
   }
-  if (!jpeg_rd || !jpeg_wr)
-  {
-    Serial.println("[ERR] JPEG prealloc failed (both)");
-    return;
-  }
-  jpeg_rd_cap = JPEG_BUF_SIZE;
-  jpeg_wr_cap = JPEG_BUF_SIZE;
+  if (!jpeg_rd || !jpeg_wr) { Serial.println("[ERR] JPEG prealloc failed (both)"); return; }
+  jpeg_rd_cap = JPEG_BUF_SIZE; jpeg_wr_cap = JPEG_BUF_SIZE;
 
-  xTaskCreatePinnedToCore(captureTask, "captureTask", 12288, nullptr, 2, nullptr, 1);
+  // --- Analysis buffers (Variant B) ---
+  if (!ana_front) {
+    size_t cap = jpeg_wr_cap > 0 ? jpeg_wr_cap : JPEG_BUF_SIZE;
+    ana_front = (uint8_t*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ana_back  = (uint8_t*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!ana_front || !ana_back) {
+      Serial.println("[WARN] Analysis PSRAM alloc failed, retry DRAM");
+      if (!ana_front) ana_front = (uint8_t*)heap_caps_malloc(cap, MALLOC_CAP_8BIT);
+      if (!ana_back)  ana_back  = (uint8_t*)heap_caps_malloc(cap, MALLOC_CAP_8BIT);
+    }
+    if (!ana_front || !ana_back) {
+      Serial.println("[ERR] Analysis buffers alloc failed");
+      // stále môžeme bežať bez analýzy, ale task potom nespúšťaj
+    } else {
+      memset(ana_front, 0, cap);
+      memset(ana_back,  0, cap);
+      ana_back_cap = cap;
+    }
+  }
+
+  if (!anaSem) anaSem = xSemaphoreCreateBinary();
+
+  Serial.printf("[boot] analysis buffers: front=%p back=%p cap=%u\n",
+                ana_front, ana_back, (unsigned)ana_back_cap);
+
+  // --- Create tasks ---
+  TaskHandle_t hCap = nullptr;
+  BaseType_t rcCap = xTaskCreatePinnedToCore(captureTask, "captureTask",
+                                             12288, nullptr, 2, &hCap, 1);
+  Serial.printf("[boot] captureTask rc=%d handle=%p\n", (int)rcCap, hCap);
+
+  TaskHandle_t hAna = nullptr;
+  if (ana_front && ana_back) {
+    BaseType_t rcAna = xTaskCreatePinnedToCore(analysisTask, "analysisTask",
+                                               12288, nullptr, 1, &hAna, 0);
+    Serial.printf("[boot] analysisTask rc=%d handle=%p\n", (int)rcAna, hAna);
+  } else {
+    Serial.println("[boot] analysisTask not started (no buffers)");
+  }
+
+  Serial.printf("[boot] pre-create captureTask, jpeg_rd=%p, jpeg_wr=%p, caps rd=%u wr=%u\n",
+                jpeg_rd, jpeg_wr, (unsigned)jpeg_rd_cap, (unsigned)jpeg_wr_cap);
+  Serial.println("[boot] startCaptureLoop() ok");
 }
+
 
 // ---- Setup/Loop ----
 void setup()
@@ -422,4 +511,71 @@ void setup()
 void loop()
 {
   server.handleClient();
+}
+
+// === Analysis task skeleton (Variant B) ===
+// Consumes only the latest published JPEG (ana_front/ana_front_len).
+// Does NOT block capture or /shot.jpg. TJpgDec-based ROI analysis will be added later.
+void analysisTask(void *arg)
+{
+  Serial.println("[analysis] started");
+  uint32_t t0 = millis();
+  uint32_t local_seen = 0;
+  for (;;)
+  {
+    // Wait for a new frame or timeout to avoid starving others
+    if (anaSem)
+    {
+      xSemaphoreTake(anaSem, pdMS_TO_TICKS(100));
+    }
+    else
+    {
+      vTaskDelay(pdMS_TO_TICKS(30));
+    }
+
+    // Try to pick up the latest snapshot
+    uint32_t s1 = ana_seq;
+    size_t len = ana_front_len;
+    uint8_t *ptr = ana_front;
+    uint32_t s2 = ana_seq;
+    if (s1 != s2)
+    {
+      // swapped during read; retry next loop
+      continue;
+    }
+    if (s1 == local_seen || ptr == nullptr || len == 0)
+    {
+      vTaskDelay(pdMS_TO_TICKS(20)); // nežiň CPU/Serial
+      continue;                      // nothing new to process
+    }
+    local_seen = s1;
+
+    // --- Placeholder for ROI analysis ---
+    // Here we'll run TJpgDec with scale=1/8 and accumulate red channel in ROI.
+    // For now, we just set a dummy measurement to prove the pipeline.
+    uint16_t fake_r_mean = 0; // TODO: compute from JPEG
+    g_last_R_mean = fake_r_mean;
+
+    // Basic EMA/hysteresis state update placeholder
+    float ema = EMA_ALPHA * (float)fake_r_mean + (1.0f - EMA_ALPHA) * g_ema;
+    g_ema = ema;
+    uint32_t now = millis();
+    if (!g_led_on)
+    {
+      if ((uint16_t)ema >= TH_ON && (now - g_last_pulse_ms) >= REFRACT_MS)
+      {
+        g_led_on = true;
+        g_pulse_counter++;
+        g_last_interpulse_ms = now - g_last_pulse_ms;
+        g_last_pulse_ms = now;
+      }
+    }
+    else
+    {
+      if ((uint16_t)ema <= TH_OFF)
+      {
+        g_led_on = false;
+      }
+    }
+  }
 }
