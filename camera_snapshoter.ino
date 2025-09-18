@@ -6,6 +6,29 @@
 #include <Preferences.h>
 #include "esp_heap_caps.h"
 
+extern "C"
+{
+#include "tjpgd.h" // Tiny JPEG Decompressor
+}
+
+// Jednoduchý zdroj pre TJpgDec (input z RAM)
+typedef struct
+{
+  const uint8_t *ptr;
+  size_t len;
+} jd_src_t;
+
+// Akumulátor pre ROI počas dekódu (v downscale priestore)
+typedef struct
+{
+  uint16_t rx, ry, rw, rh; // ROI po downscale 1/8
+  uint32_t r_sum;          // suma R(0..255)
+  uint32_t count;          // počet vzoriek v ROI
+} roi_accum_t;
+
+static roi_accum_t g_acc = {}; // jednorazovo použitý akumulátor
+static uint8_t jd_work[4096];  // workspace pre TJpgDec (4–6 kB stačí)
+
 // ====== Wi-Fi ======
 const char *WIFI_SSID = "C3PO-IoT";
 const char *WIFI_PASS = "IoT@Wifi#2025";
@@ -56,6 +79,30 @@ bool saveRoiToNvs(const RoiConfig &r)
   prefs.end();
   return true;
 }
+
+static int jd_output_rgb565(JDEC *jd, void *bitmap, JRECT *rect);
+
+// správne pre tvoju tjpgd.h
+static size_t jd_input(JDEC *jd, uint8_t *buff, size_t nbyte)
+{
+  jd_src_t *src = (jd_src_t *)jd->device;
+  if (buff)
+  { // čítanie
+    size_t to_read = (nbyte < src->len) ? nbyte : src->len;
+    memcpy(buff, src->ptr, to_read);
+    src->ptr += to_read;
+    src->len -= to_read;
+    return to_read;
+  }
+  else
+  { // skip
+    size_t to_skip = (nbyte < src->len) ? nbyte : src->len;
+    src->ptr += to_skip;
+    src->len -= to_skip;
+    return to_skip;
+  }
+}
+
 bool loadRoiFromNvs(RoiConfig &r)
 {
   if (!prefs.begin(NVS_NS, true))
@@ -230,6 +277,81 @@ void handleHealth()
   server.send(200, "application/json", s);
 }
 
+// ---- /config ----
+// GET -> vráti aktuálne hodnoty
+// POST -> {"th_on":150,"th_off":120,"ema":0.3,"refract_ms":200,"save":true}
+// ---- /config ----
+// GET  -> vráti aktuálne hodnoty
+// POST -> {"th_on":150,"th_off":120,"ema":0.3,"refract_ms":200,"save":true}
+void handleConfig() {
+  StaticJsonDocument<512> doc;
+  bool changed = false, saved = false;
+
+  if (server.method() == HTTP_POST) {
+    String body = server.arg("plain");
+    if (body.length() == 0) {
+      server.send(400, "application/json", "{\"status\":\"error\",\"reason\":\"empty body\"}");
+      return;
+    }
+    DeserializationError err = deserializeJson(doc, body);
+    if (err) {
+      server.send(400, "application/json", "{\"status\":\"error\",\"reason\":\"invalid json\"}");
+      return;
+    }
+
+    if (doc.containsKey("th_on")) {
+      TH_ON      = constrain(doc["th_on"].as<int>(),        0,   255);
+      changed = true;
+    }
+    if (doc.containsKey("th_off")) {
+      TH_OFF     = constrain(doc["th_off"].as<int>(),       0,   255);
+      changed = true;
+    }
+    if (doc.containsKey("ema")) {
+      float a = doc["ema"].as<float>();
+      EMA_ALPHA  = constrain(doc["ema"].as<float>(),     0.01f, 0.99f);
+      changed = true;
+    }
+    if (doc.containsKey("refract_ms")) {
+      REFRACT_MS = constrain(doc["refract_ms"].as<uint32_t>(), 10u, 5000u);
+      changed = true;
+    }
+
+    // (odporúčanie) garantuj hysterézu:
+    if (TH_OFF >= TH_ON) TH_OFF = (TH_ON > 0) ? (TH_ON - 1) : 0;
+
+    bool doSave = doc["save"] | false;
+    if (doSave) {
+      Preferences p;
+      if (p.begin("det_cfg", false)) {
+        p.putUShort("th_on",  TH_ON);
+        p.putUShort("th_off", TH_OFF);
+        p.putUInt  ("refract", REFRACT_MS);
+        p.putFloat ("ema",     EMA_ALPHA);
+        p.end();
+        saved = true;
+      }
+    }
+  }
+
+  StaticJsonDocument<512> out;
+  out["status"]      = "ok";
+  out["changed"]     = changed;
+  out["saved"]       = saved;
+  out["th_on"]       = TH_ON;
+  out["th_off"]      = TH_OFF;
+  out["ema"]         = EMA_ALPHA;
+  out["refract_ms"]  = REFRACT_MS;
+  out["state"]       = g_led_on ? "ON" : "OFF";
+  out["intensity_R"] = (uint16_t)g_last_R_mean;
+  out["ema_R"]       = (uint16_t)g_ema;
+
+  String resp;
+  serializeJson(out, resp);
+  server.send(200, "application/json", resp);
+}
+
+
 // (voliteľné) ROI API – pripravené, zatiaľ nevystavujeme
 void handleRoi()
 {
@@ -270,6 +392,38 @@ void handleRoi()
   String response;
   serializeJson(res, response);
   server.send(200, "application/json", response);
+}
+
+// ---- /pulse (diagnostika detektora) ----
+void handlePulse()
+{
+  StaticJsonDocument<512> doc;
+  doc["counter"] = (uint32_t)g_pulse_counter;
+  doc["last_pulse_ms"] = (uint32_t)g_last_pulse_ms;
+  doc["interpulse_ms"] = (uint32_t)g_last_interpulse_ms;
+  doc["intensity_R"] = (uint16_t)g_last_R_mean; // priemer R z ROI (0..255)
+  doc["ema_R"] = (uint16_t)g_ema;               // vyhladená hodnota
+  doc["state"] = g_led_on ? "ON" : "OFF";
+  doc["th_on"] = (uint16_t)TH_ON;
+  doc["th_off"] = (uint16_t)TH_OFF;
+  doc["refract_ms"] = (uint32_t)REFRACT_MS;
+  doc["seq"] = (uint32_t)ana_seq; // posledné publikované snapshot ID
+
+  // (nepovinné) info o framochní z /health
+  volatile uint32_t last_frame_ms;
+  uint32_t now = millis();
+  doc["frame_ms"] = (uint32_t)last_frame_ms;       // čas posledného capture
+  doc["age_ms"] = (uint32_t)(now - last_frame_ms); // ako starý je posledný frame
+
+  // ROI ak ju máš v globále 'roi'
+  doc["roi"]["x"] = (uint16_t)roi.x;
+  doc["roi"]["y"] = (uint16_t)roi.y;
+  doc["roi"]["w"] = (uint16_t)roi.w;
+  doc["roi"]["h"] = (uint16_t)roi.h;
+
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
 }
 
 // ---- Kamera ----
@@ -364,41 +518,62 @@ void startCaptureLoop()
 {
   Serial.println("[boot] startCaptureLoop() enter");
 
-  if (!jpegMtx) jpegMtx = xSemaphoreCreateMutex();
-  if (!jpegMtx) { Serial.println("[ERR] Cannot create jpegMtx"); return; }
+  if (!jpegMtx)
+    jpegMtx = xSemaphoreCreateMutex();
+  if (!jpegMtx)
+  {
+    Serial.println("[ERR] Cannot create jpegMtx");
+    return;
+  }
 
   // --- JPEG publish buffers ---
   jpeg_rd = (uint8_t *)heap_caps_malloc(JPEG_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   jpeg_wr = (uint8_t *)heap_caps_malloc(JPEG_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!jpeg_rd || !jpeg_wr) {
+  if (!jpeg_rd || !jpeg_wr)
+  {
     Serial.println("[WARN] JPEG PSRAM alloc failed, retry DRAM");
-    if (!jpeg_rd) jpeg_rd = (uint8_t *)heap_caps_malloc(JPEG_BUF_SIZE, MALLOC_CAP_8BIT);
-    if (!jpeg_wr) jpeg_wr = (uint8_t *)heap_caps_malloc(JPEG_BUF_SIZE, MALLOC_CAP_8BIT);
+    if (!jpeg_rd)
+      jpeg_rd = (uint8_t *)heap_caps_malloc(JPEG_BUF_SIZE, MALLOC_CAP_8BIT);
+    if (!jpeg_wr)
+      jpeg_wr = (uint8_t *)heap_caps_malloc(JPEG_BUF_SIZE, MALLOC_CAP_8BIT);
   }
-  if (!jpeg_rd || !jpeg_wr) { Serial.println("[ERR] JPEG prealloc failed (both)"); return; }
-  jpeg_rd_cap = JPEG_BUF_SIZE; jpeg_wr_cap = JPEG_BUF_SIZE;
+  if (!jpeg_rd || !jpeg_wr)
+  {
+    Serial.println("[ERR] JPEG prealloc failed (both)");
+    return;
+  }
+  jpeg_rd_cap = JPEG_BUF_SIZE;
+  jpeg_wr_cap = JPEG_BUF_SIZE;
 
   // --- Analysis buffers (Variant B) ---
-  if (!ana_front) {
+  if (!ana_front)
+  {
     size_t cap = jpeg_wr_cap > 0 ? jpeg_wr_cap : JPEG_BUF_SIZE;
-    ana_front = (uint8_t*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    ana_back  = (uint8_t*)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!ana_front || !ana_back) {
+    ana_front = (uint8_t *)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ana_back = (uint8_t *)heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!ana_front || !ana_back)
+    {
       Serial.println("[WARN] Analysis PSRAM alloc failed, retry DRAM");
-      if (!ana_front) ana_front = (uint8_t*)heap_caps_malloc(cap, MALLOC_CAP_8BIT);
-      if (!ana_back)  ana_back  = (uint8_t*)heap_caps_malloc(cap, MALLOC_CAP_8BIT);
+      if (!ana_front)
+        ana_front = (uint8_t *)heap_caps_malloc(cap, MALLOC_CAP_8BIT);
+      if (!ana_back)
+        ana_back = (uint8_t *)heap_caps_malloc(cap, MALLOC_CAP_8BIT);
     }
-    if (!ana_front || !ana_back) {
+    if (!ana_front || !ana_back)
+    {
       Serial.println("[ERR] Analysis buffers alloc failed");
       // stále môžeme bežať bez analýzy, ale task potom nespúšťaj
-    } else {
+    }
+    else
+    {
       memset(ana_front, 0, cap);
-      memset(ana_back,  0, cap);
+      memset(ana_back, 0, cap);
       ana_back_cap = cap;
     }
   }
 
-  if (!anaSem) anaSem = xSemaphoreCreateBinary();
+  if (!anaSem)
+    anaSem = xSemaphoreCreateBinary();
 
   Serial.printf("[boot] analysis buffers: front=%p back=%p cap=%u\n",
                 ana_front, ana_back, (unsigned)ana_back_cap);
@@ -410,11 +585,14 @@ void startCaptureLoop()
   Serial.printf("[boot] captureTask rc=%d handle=%p\n", (int)rcCap, hCap);
 
   TaskHandle_t hAna = nullptr;
-  if (ana_front && ana_back) {
+  if (ana_front && ana_back)
+  {
     BaseType_t rcAna = xTaskCreatePinnedToCore(analysisTask, "analysisTask",
                                                12288, nullptr, 1, &hAna, 0);
     Serial.printf("[boot] analysisTask rc=%d handle=%p\n", (int)rcAna, hAna);
-  } else {
+  }
+  else
+  {
     Serial.println("[boot] analysisTask not started (no buffers)");
   }
 
@@ -422,7 +600,6 @@ void startCaptureLoop()
                 jpeg_rd, jpeg_wr, (unsigned)jpeg_rd_cap, (unsigned)jpeg_wr_cap);
   Serial.println("[boot] startCaptureLoop() ok");
 }
-
 
 // ---- Setup/Loop ----
 void setup()
@@ -502,7 +679,9 @@ void setup()
   server.on("/", handleRoot);
   server.on("/shot.jpg", HTTP_GET, handleShotJpg);
   server.on("/health", HTTP_GET, handleHealth);
-  // server.on("/roi", handleRoi);
+  server.on("/roi", handleRoi);
+  server.on("/pulse", HTTP_GET, handlePulse);
+  server.on("/config", HTTP_ANY, handleConfig);
 
   server.begin();
   Serial.println("HTTP server started on port 8080");
@@ -511,6 +690,79 @@ void setup()
 void loop()
 {
   server.handleClient();
+}
+
+//  ---  ANALYTIC ---
+
+// Presnejší prepočet 5-bit → 8-bit
+static inline uint8_t r5_to_r8(uint16_t r5)
+{
+  return (uint8_t)((r5 * 527 + 23) >> 6); // klasický 5→8 bit expand
+}
+
+// Volá TJpgDec pre každý vydaný blok pixelov
+// neutrálna verzia, funguje so všetkými tjpgd.h
+static int jd_output_rgb565(JDEC *jd, void *bitmap, JRECT *rect)
+{
+  // rect sú súradnice v downscale priestore (vrátane)
+  uint16_t *p = (uint16_t *)bitmap;
+  const uint16_t w = rect->right - rect->left + 1;
+  const uint16_t h = rect->bottom - rect->top + 1;
+
+  for (uint16_t dy = 0; dy < h; ++dy)
+  {
+    uint16_t yy = rect->top + dy;
+    if (yy < g_acc.ry || yy >= g_acc.ry + g_acc.rh)
+    {
+      p += w;
+      continue;
+    }
+    for (uint16_t dx = 0; dx < w; ++dx)
+    {
+      uint16_t xx = rect->left + dx;
+      if (xx >= g_acc.rx && xx < g_acc.rx + g_acc.rw)
+      {
+        uint16_t px = p[dx]; // RGB565
+        uint16_t r5 = (px >> 11) & 0x1F;
+        g_acc.r_sum += r5_to_r8(r5); // 0..255
+        g_acc.count++;
+      }
+    }
+    p += w;
+  }
+  return 1; // pokračuj
+}
+
+// Vypočíta priemerný R (0..255) v ROI z JPEG bufferu pri scale=1/8.
+// 'roi' je v plnom rozlíšení (SXGA). Funkcia mapuje ROI do downscale priestoru.
+static bool compute_roi_rmean_jpeg_1_8(const uint8_t *jpeg, size_t len,
+                                       const decltype(roi) &roi_full,
+                                       uint16_t *out_mean_r8)
+{
+  if (!jpeg || !len)
+    return false;
+
+  // Prepočet ROI do downscale (zaokrúhľujeme nahor, aby ROI nevypadla)
+  g_acc = {};
+  g_acc.rx = roi_full.x / 8;
+  g_acc.ry = roi_full.y / 8;
+  g_acc.rw = (roi_full.w + 7) / 8;
+  g_acc.rh = (roi_full.h + 7) / 8;
+
+  JDEC jd;
+  jd_src_t src = {.ptr = jpeg, .len = len};
+  JRESULT jr = jd_prepare(&jd, jd_input, jd_work, sizeof(jd_work), (void *)&src);
+  if (jr != JDR_OK)
+    return false;
+
+  jr = jd_decomp(&jd, jd_output_rgb565, 3 /* JD_SCALE=3 → 1/8 */);
+  if (jr != JDR_OK)
+    return false;
+
+  if (g_acc.count == 0)
+    return false;
+  *out_mean_r8 = (uint16_t)(g_acc.r_sum / g_acc.count);
+  return true;
 }
 
 // === Analysis task skeleton (Variant B) ===
@@ -550,16 +802,24 @@ void analysisTask(void *arg)
     }
     local_seen = s1;
 
-    // --- Placeholder for ROI analysis ---
-    // Here we'll run TJpgDec with scale=1/8 and accumulate red channel in ROI.
-    // For now, we just set a dummy measurement to prove the pipeline.
-    uint16_t fake_r_mean = 0; // TODO: compute from JPEG
-    g_last_R_mean = fake_r_mean;
+    // --- JPEG → R-mean v ROI (1/8) ---
+    uint16_t rmean = 0;
+    bool ok = compute_roi_rmean_jpeg_1_8(ptr, len, roi, &rmean);
+    if (!ok)
+    {
+      // ak dekód zlyhal, daj krátku pauzu a skús ďalší frame
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
 
-    // Basic EMA/hysteresis state update placeholder
-    float ema = EMA_ALPHA * (float)fake_r_mean + (1.0f - EMA_ALPHA) * g_ema;
+    // Publikuj diagnostiku a filtruj
+    g_last_R_mean = rmean;
+
+    // EMA + hysteréza + refraktér
+    float ema = EMA_ALPHA * (float)rmean + (1.0f - EMA_ALPHA) * g_ema;
     g_ema = ema;
     uint32_t now = millis();
+
     if (!g_led_on)
     {
       if ((uint16_t)ema >= TH_ON && (now - g_last_pulse_ms) >= REFRACT_MS)

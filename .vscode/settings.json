@@ -1,0 +1,7 @@
+{
+    "files.associations": {
+        "*.asset": "plaintext",
+        "algorithm": "cpp",
+        "xutility": "cpp"
+    }
+}
